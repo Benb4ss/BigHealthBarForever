@@ -1,16 +1,25 @@
-
 -- Big player and target health bars.
 -- Custom StatusBars over Blizzard's health bars.
 
 -- ===== Shared tuning =====
 local WIDTH_ADJUST = 4
 local HEIGHT = 75
+local SUB_BAR_HEIGHT = HEIGHT / 2
 local OFFSET_X = -2
 local OFFSET_Y = 36
 local STRATA = "MEDIUM"
+
+-- Frame levels, bottom to top:
+-- background < absorb bar < heal bar < health fill (overlay)
+local BG_LEVEL = 46
+local ABSORB_LEVEL = 47
+local HEAL_LEVEL = 48
 local LEVEL = 50
+
 local FILL_TEXTURE = "Interface\\TargetingFrame\\UI-StatusBar"
 local BG_COLOR = { 0.05, 0.05, 0.05, 0.90 }
+local HEAL_COLOR = { 0.00, 0.80, 0.30, 0.60 }
+local ABSORB_COLOR = { 0.80, 0.80, 0.80, 0.70 }
 
 local MASK_LEFT = 0
 local MASK_TOP = 0
@@ -44,6 +53,25 @@ local function HideBlizzardName(...)
     end
 end
 
+-- Hides Blizzard's incoming heal and absorb bars so they don't show
+-- alongside ours. Matches by key name, same approach as HideBlizzardName.
+local function HideBlizzardPrediction(...)
+    for _, parent in ipairs({ ... }) do
+        if parent then
+            for key, value in pairs(parent) do
+                if type(key) == "string"
+                    and (string.find(key, "Prediction")
+                        or string.find(key, "Absorb"))
+                    and type(value) == "table"
+                    and value.SetAlpha then
+
+                    value:SetAlpha(0)
+                end
+            end
+        end
+    end
+end
+
 local function TrimLastChar(s)
     s = s:sub(1, -2)
 
@@ -62,10 +90,10 @@ end
 
 local function FitName(bar, nameText, unit)
     local name, surname = UnitName(unit)
-	name = name or ""
-	if surname and surname ~= "" then
-		name = name .. " " .. surname
-	end
+    name = name or ""
+    if surname and surname ~= "" then
+        name = name .. " " .. surname
+    end
     local maxWidth = bar:GetWidth() - 4
 
     if name == nameText.lastName
@@ -96,7 +124,7 @@ end
 local function CreateBackground(parent)
     local background = CreateFrame("Frame", nil, parent)
     background:SetFrameStrata(STRATA)
-    background:SetFrameLevel(LEVEL - 1)
+    background:SetFrameLevel(BG_LEVEL)
 
     local texture = background:CreateTexture(nil, "BACKGROUND")
     texture:SetAllPoints()
@@ -217,6 +245,105 @@ local function UpdateHealth(overlay, healthText, unit)
     end
 end
 
+-- Registers an event without erroring if the client doesn't know the name.
+local function SafeRegister(frame, event, unit)
+    if unit then
+        pcall(frame.RegisterUnitEvent, frame, event, unit)
+    else
+        pcall(frame.RegisterEvent, frame, event)
+    end
+end
+
+-- Creates the heal and absorb bars next to the health fill.
+--
+-- No Lua arithmetic is done on health. Each track is anchored to the
+-- edge of the bar before it, so Blizzard's fill textures place it:
+--   health fill -> heal track (starts at health edge, width = missing health)
+--   heal fill   -> absorb track (starts at heal edge, runs to bar right edge)
+--
+-- Known limit: the absorb bar uses missing health as its scale. This is
+-- exact when no heals are incoming. With incoming heals, the absorb is
+-- drawn slightly short of its true width.
+--
+-- Returns an Update function that refreshes both bars.
+local function CreatePredictionBars(container, overlay, unit)
+    local calc = CreateUnitHealPredictionCalculator()
+    local fill = overlay:GetStatusBarTexture()
+
+    local healTrack = CreateFrame("Frame", nil, container)
+    healTrack:SetFrameStrata(STRATA)
+    healTrack:SetFrameLevel(HEAL_LEVEL)
+    healTrack:SetPoint("LEFT", fill, "RIGHT")
+    healTrack:SetPoint("RIGHT", overlay, "RIGHT")
+    healTrack:SetHeight(SUB_BAR_HEIGHT)
+
+    local healBar = CreateFrame("StatusBar", nil, healTrack)
+    healBar:EnableMouse(false)
+    healBar:SetStatusBarTexture(FILL_TEXTURE)
+    healBar:SetStatusBarColor(
+        HEAL_COLOR[1],
+        HEAL_COLOR[2],
+        HEAL_COLOR[3],
+        HEAL_COLOR[4]
+    )
+    healBar:SetAllPoints(healTrack)
+    healBar:SetFrameStrata(STRATA)
+    healBar:SetFrameLevel(HEAL_LEVEL)
+
+    local absorbTrack = CreateFrame("Frame", nil, container)
+    absorbTrack:SetFrameStrata(STRATA)
+    absorbTrack:SetFrameLevel(ABSORB_LEVEL)
+    absorbTrack:SetPoint("LEFT", healBar:GetStatusBarTexture(), "RIGHT")
+    absorbTrack:SetPoint("RIGHT", overlay, "RIGHT")
+    absorbTrack:SetHeight(SUB_BAR_HEIGHT)
+
+    local absorbBar = CreateFrame("StatusBar", nil, absorbTrack)
+    absorbBar:EnableMouse(false)
+    absorbBar:SetStatusBarTexture(FILL_TEXTURE)
+    absorbBar:SetStatusBarColor(
+        ABSORB_COLOR[1],
+        ABSORB_COLOR[2],
+        ABSORB_COLOR[3],
+        ABSORB_COLOR[4]
+    )
+    absorbBar:SetAllPoints(absorbTrack)
+    absorbBar:SetFrameStrata(STRATA)
+    absorbBar:SetFrameLevel(ABSORB_LEVEL)
+
+    local function Update()
+        if not UnitExists(unit) then
+            healTrack:Hide()
+            absorbTrack:Hide()
+            return
+        end
+
+        UnitGetDetailedHealPrediction(unit, nil, calc)
+
+        local missing = calc:GetMissingHealth()
+        local incoming = calc:GetIncomingHeals()
+        local damageAbsorbs = calc:GetDamageAbsorbs()
+
+        -- Values go straight into the bars, with no arithmetic on them.
+        -- pcall stops a failure here from breaking the addon.
+        local ok = pcall(function()
+            healBar:SetMinMaxValues(0, missing)
+            healBar:SetValue(incoming)
+            absorbBar:SetMinMaxValues(0, missing)
+            absorbBar:SetValue(damageAbsorbs)
+        end)
+
+        if ok then
+            healTrack:Show()
+            absorbTrack:Show()
+        else
+            healTrack:Hide()
+            absorbTrack:Hide()
+        end
+    end
+
+    return Update
+end
+
 -- ===== Player health bar =====
 do
     local unit = "player"
@@ -246,12 +373,13 @@ do
         21
     )
 
-    -- Hide Blizzard's original health text and name.
+    -- Hide Blizzard's original health text, name, and prediction bars.
     if container.HealthBarText then
         container.HealthBarText:SetAlpha(0)
     end
 
     HideBlizzardName(playerFrame, playerMain)
+    HideBlizzardPrediction(container, blizzBar)
 
     -- Dark background behind the player mana bar.
     local manaArea = playerMain.ManaBarArea
@@ -268,9 +396,12 @@ do
     manaTexture:SetAllPoints()
     manaTexture:SetColorTexture(0.05, 0.05, 0.05, 1)
 
+    local UpdatePrediction = CreatePredictionBars(container, overlay, unit)
+
     local function ApplyColor()
         local _, token = UnitClass(unit)
-        local color = token and RAID_CLASS_COLORS[token]
+        local color = token and CUSTOM_CLASS_COLORS and CUSTOM_CLASS_COLORS[token]
+            or token and RAID_CLASS_COLORS[token]
 
         if color then
             overlay:SetStatusBarColor(color.r, color.g, color.b)
@@ -284,6 +415,7 @@ do
         ApplyColor()
         FitName(overlay, nameText, unit)
         UpdateHealth(overlay, healthText, unit)
+        UpdatePrediction()
 
         background:Show()
         manaBackground:Show()
@@ -296,6 +428,8 @@ do
     events:RegisterEvent("UNIT_MAXHEALTH")
     events:RegisterEvent("UNIT_NAME_UPDATE")
     events:RegisterEvent("UNIT_DISPLAYPOWER")
+    SafeRegister(events, "UNIT_HEAL_PREDICTION")
+    SafeRegister(events, "UNIT_ABSORB_AMOUNT_CHANGED")
 
     events:SetScript("OnEvent", function(_, event, eventUnit)
         if event ~= "PLAYER_ENTERING_WORLD"
@@ -343,6 +477,9 @@ do
     end
 
     HideBlizzardName(targetFrame, targetMain)
+    HideBlizzardPrediction(container, blizzBar)
+
+    local UpdatePrediction = CreatePredictionBars(container, overlay, unit)
 
     local function ApplyColor()
         local ok, r, g, b = pcall(function()
@@ -351,9 +488,9 @@ do
             end
 
             local _, token = UnitClass(unit)
-            token = token or UnitClassBase(unit)
+            local color = token and CUSTOM_CLASS_COLORS and CUSTOM_CLASS_COLORS[token]
+                or token and RAID_CLASS_COLORS[token]
 
-            local color = token and RAID_CLASS_COLORS[token]
             if color then
                 return color.r, color.g, color.b
             end
@@ -362,9 +499,7 @@ do
         if ok and r then
             overlay:SetStatusBarColor(r, g, b)
         else
-            overlay:SetStatusBarColor(
-                UnitSelectionColor(unit, false)
-            )
+            overlay:SetStatusBarColor(UnitSelectionColor(unit, false))
         end
     end
 
@@ -372,6 +507,7 @@ do
         if not UnitExists(unit) then
             overlay:Hide()
             background:Hide()
+            UpdatePrediction()
             return
         end
 
@@ -379,6 +515,7 @@ do
         ApplyColor()
         FitName(overlay, nameText, unit)
         UpdateHealth(overlay, healthText, unit)
+        UpdatePrediction()
 
         background:Show()
         overlay:Show()
@@ -391,6 +528,8 @@ do
     events:RegisterUnitEvent("UNIT_MAXHEALTH", unit)
     events:RegisterUnitEvent("UNIT_FACTION", unit)
     events:RegisterUnitEvent("UNIT_NAME_UPDATE", unit)
+    SafeRegister(events, "UNIT_HEAL_PREDICTION", unit)
+    SafeRegister(events, "UNIT_ABSORB_AMOUNT_CHANGED", unit)
 
     events:SetScript("OnEvent", Update)
 
