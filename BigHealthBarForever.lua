@@ -521,6 +521,34 @@ do
         overlay:Show()
     end
 
+    -- Recovery wrapper: an error must not permanently hide the bar.
+    -- The error is reported once per failure streak so the root cause
+    -- stays visible instead of being silently swallowed by pcall.
+    local reported = false
+
+    local function SafeUpdate()
+        local ok, err = pcall(Update)
+
+        if not ok then
+            if not reported then
+                reported = true
+                print("BigTargetHealthBar: update failed: " .. tostring(err))
+            end
+
+            local existsOK, exists = pcall(UnitExists, unit)
+
+            if existsOK and exists then
+                pcall(function()
+                    ApplyLayout(overlay, blizzBar)
+                    background:Show()
+                    overlay:Show()
+                end)
+            end
+        else
+            reported = false
+        end
+    end
+
     local events = CreateFrame("Frame")
     events:RegisterEvent("PLAYER_TARGET_CHANGED")
     events:RegisterEvent("PLAYER_ENTERING_WORLD")
@@ -531,7 +559,23 @@ do
     SafeRegister(events, "UNIT_HEAL_PREDICTION", unit)
     SafeRegister(events, "UNIT_ABSORB_AMOUNT_CHANGED", unit)
 
-    events:SetScript("OnEvent", Update)
+    events:SetScript("OnEvent", function()
+        SafeUpdate()
+    end)
 
-    Update()
+    -- Failsafe: rerun the full update once per second. Covers missed
+    -- events, mistimed targeting, and any state where the bar ended
+    -- up hidden or covered without an event to recover it.
+    local elapsed = 0
+
+    events:SetScript("OnUpdate", function(self, delta)
+        elapsed = elapsed + delta
+
+        if elapsed >= 1 then
+            elapsed = 0
+            SafeUpdate()
+        end
+    end)
+
+    SafeUpdate()
 end
