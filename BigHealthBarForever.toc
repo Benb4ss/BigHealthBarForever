@@ -1,0 +1,8 @@
+## Interface: 16001
+## Title: BigHealthBarForever
+## Notes: Big Health Bar for Player and Target Unit Frames
+## Author:  Benbass
+## IconTexture: Interface\AddOns\BigHealthBarForever\logo
+## Category: Unit Frames
+
+BigHealthBarForever.lua
