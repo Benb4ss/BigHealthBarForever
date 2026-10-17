@@ -88,13 +88,84 @@ local function TrimLastChar(s)
     return s
 end
 
+-- Runs a measurement and returns its result only when the value is
+-- usable by addon code. Secret numbers survive a plain pcall and only
+-- error later, at the first forbidden operation, so the probe does
+-- that operation on the value itself. Returns nil for secrets.
+local function SafeMeasure(fn)
+    local ok, v = pcall(fn)
+    if not ok or v == nil then
+        return nil
+    end
+
+    if not pcall(function()
+        return v <= v
+    end) then
+        return nil
+    end
+
+    return v
+end
+
+-- Standalone font string for measuring text, created outside
+-- Blizzard's frame tree. Font measurements on font strings inside
+-- that tree (nameText is parented to the unit frame) can come back
+-- as secret values, so all text measuring happens here instead.
+local measureFrame = CreateFrame("Frame")
+measureFrame:Hide()
+
+local measureText = measureFrame:CreateFontString(
+    nil,
+    "OVERLAY",
+    "GameFontNormal"
+)
+
+local function MeasureText(text)
+    return SafeMeasure(function()
+        measureText:SetText(text)
+        return measureText:GetStringWidth()
+    end)
+end
+
 local function FitName(bar, nameText, unit)
     local name, surname = UnitName(unit)
     name = name or ""
     if surname and surname ~= "" then
         name = name .. " " .. surname
     end
-    local maxWidth = bar:GetWidth() - 4
+
+    -- Only a real, positive bar width is trusted. Secret or missing
+    -- widths fall back to the last good one and never poison the
+    -- cache with a zero, which is what made the fit stick as
+    -- untrimmed before.
+    local maxWidth = SafeMeasure(function()
+        return bar:GetWidth() - 4
+    end)
+
+    if maxWidth and maxWidth > 0 then
+        nameText.lastGoodWidth = maxWidth
+    else
+        maxWidth = nameText.lastGoodWidth
+    end
+
+    local textWidth = MeasureText(name)
+
+    if not maxWidth or not textWidth then
+        -- Measurement unavailable. Reuse the last fitted text for
+        -- this name when one exists; show the full name for names
+        -- never fitted. Nothing is cached, so the next update
+        -- retries the fit.
+        local fit = nameText.fits and nameText.fits[name]
+
+        if fit then
+            nameText:SetText(fit)
+        else
+            nameText:SetText(name)
+            nameText.lastName = nil
+        end
+
+        return
+    end
 
     if name == nameText.lastName
         and maxWidth == nameText.lastWidth then
@@ -103,21 +174,45 @@ local function FitName(bar, nameText, unit)
 
     nameText.lastName = name
     nameText.lastWidth = maxWidth
-    nameText:SetText(name)
+    nameText.fits = nameText.fits or {}
 
-    if maxWidth <= 0 or nameText:GetStringWidth() <= maxWidth then
-        return
+    local fitted = name
+
+    if maxWidth > 0 and textWidth > maxWidth then
+        local s = name
+
+        while #s > 0 do
+            s = TrimLastChar(s)
+            fitted = s .. "..."
+
+            local width = MeasureText(fitted)
+
+            if not width then
+                -- Secret state mid-trim: fall back to the last good
+                -- fit for this name.
+                fitted = nameText.fits[name] or name
+                break
+            end
+
+            if width <= maxWidth then
+                break
+            end
+        end
     end
 
-    local s = name
+    nameText:SetText(fitted)
+    nameText.fits[name] = fitted
 
-    while #s > 0 do
-        s = TrimLastChar(s)
-        nameText:SetText(s .. "...")
+    -- Keep the fit cache bounded.
+    local count = 0
 
-        if nameText:GetStringWidth() <= maxWidth then
-            return
-        end
+    for _ in pairs(nameText.fits) do
+        count = count + 1
+    end
+
+    if count > 50 then
+        wipe(nameText.fits)
+        nameText.fits[name] = fitted
     end
 end
 
@@ -203,12 +298,11 @@ local function CreateOverlay(parent, blizzBar, blizzMask, globalName)
     return overlay, nameText, healthText
 end
 
+-- Blizzard frame widths can come back as secret number values once
+-- combat starts, and GetWidth() + WIDTH_ADJUST then errors out. The
+-- layout anchors both edges instead of reading any width, so it stays
+-- taint-safe during combat.
 local function ApplyLayout(overlay, blizzBar)
-    overlay:SetSize(
-        blizzBar:GetWidth() + WIDTH_ADJUST,
-        HEIGHT
-    )
-
     overlay:ClearAllPoints()
     overlay:SetPoint(
         "TOPLEFT",
@@ -217,6 +311,14 @@ local function ApplyLayout(overlay, blizzBar)
         OFFSET_X,
         OFFSET_Y
     )
+    overlay:SetPoint(
+        "TOPRIGHT",
+        blizzBar,
+        "TOPRIGHT",
+        WIDTH_ADJUST + OFFSET_X,
+        OFFSET_Y
+    )
+    overlay:SetHeight(HEIGHT)
 
     overlay:SetFrameStrata(STRATA)
     overlay:SetFrameLevel(LEVEL)
@@ -388,9 +490,11 @@ do
     local manaBackground = CreateFrame("Frame", nil, manaArea)
     manaBackground:SetPoint("TOPLEFT", manaBar, "TOPLEFT", -1, 1)
     manaBackground:SetPoint("BOTTOMRIGHT", manaBar, "BOTTOMRIGHT", 1, -1)
-    manaBackground:SetFrameLevel(
-        math.max(0, manaBar:GetFrameLevel() - 1)
-    )
+    -- GetFrameLevel() can also return a secret value in combat.
+    local okLevel, level = pcall(function()
+        return math.max(0, manaBar:GetFrameLevel() - 1)
+    end)
+    manaBackground:SetFrameLevel(okLevel and level or 0)
 
     local manaTexture = manaBackground:CreateTexture(nil, "BACKGROUND")
     manaTexture:SetAllPoints()
@@ -422,6 +526,30 @@ do
         overlay:Show()
     end
 
+    -- Same recovery wrapper as the target bar: a secret-value error
+    -- during combat must not leave the player bar hidden.
+    local reported = false
+
+    local function SafeUpdate()
+        local ok, err = pcall(Update)
+
+        if not ok then
+            if not reported then
+                reported = true
+                print("BigPlayerHealthBar: update failed: " .. tostring(err))
+            end
+
+            pcall(ApplyLayout, overlay, blizzBar)
+            pcall(function()
+                background:Show()
+                manaBackground:Show()
+                overlay:Show()
+            end)
+        else
+            reported = false
+        end
+    end
+
     local events = CreateFrame("Frame")
     events:RegisterEvent("PLAYER_ENTERING_WORLD")
     events:RegisterEvent("UNIT_HEALTH")
@@ -437,10 +565,10 @@ do
             return
         end
 
-        Update()
+        SafeUpdate()
     end)
 
-    Update()
+    SafeUpdate()
 end
 
 -- ===== Target health bar =====
@@ -538,8 +666,12 @@ do
             local existsOK, exists = pcall(UnitExists, unit)
 
             if existsOK and exists then
+                -- ApplyLayout runs in its own pcall so a secret-value
+                -- error here can never skip the Show calls below. The
+                -- old version bundled them together, which is why the
+                -- bar vanished for the rest of the fight.
+                pcall(ApplyLayout, overlay, blizzBar)
                 pcall(function()
-                    ApplyLayout(overlay, blizzBar)
                     background:Show()
                     overlay:Show()
                 end)
