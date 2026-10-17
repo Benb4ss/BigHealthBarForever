@@ -356,30 +356,24 @@ local function SafeRegister(frame, event, unit)
     end
 end
 
--- Creates the heal and absorb bars next to the health fill.
+-- Creates the heal and absorb bars over the health bar.
 --
--- No Lua arithmetic is done on health. Each track is anchored to the
--- edge of the bar before it, so Blizzard's fill textures place it:
---   health fill -> heal track (starts at health edge, width = missing health)
---   heal fill   -> absorb track (starts at heal edge, runs to bar right edge)
+-- Both bars are as wide as the health bar and scaled to max health, the
+-- same scale Blizzard uses (UnitFrame.lua lines 248, 310, 316). Unlike
+-- Blizzard, they are not clamped to the bar, so they can run past its
+-- right edge when incoming heals or absorbs exceed missing health.
+-- Each bar starts at the edge of the one before it:
+--   health fill -> heal bar -> absorb bar
 --
--- Known limit: the absorb bar uses missing health as its scale. This is
--- exact when no heals are incoming. With incoming heals, the absorb is
--- drawn slightly short of its true width.
+-- Width is read from the overlay and cached, like FitName's
+-- lastGoodWidth, so a secret value in combat keeps the last good width.
 --
 -- Returns an Update function that refreshes both bars.
 local function CreatePredictionBars(container, overlay, unit)
-    local calc = CreateUnitHealPredictionCalculator()
     local fill = overlay:GetStatusBarTexture()
+    local barWidth = 0
 
-    local healTrack = CreateFrame("Frame", nil, container)
-    healTrack:SetFrameStrata(STRATA)
-    healTrack:SetFrameLevel(HEAL_LEVEL)
-    healTrack:SetPoint("LEFT", fill, "RIGHT")
-    healTrack:SetPoint("RIGHT", overlay, "RIGHT")
-    healTrack:SetHeight(SUB_BAR_HEIGHT)
-
-    local healBar = CreateFrame("StatusBar", nil, healTrack)
+    local healBar = CreateFrame("StatusBar", nil, container)
     healBar:EnableMouse(false)
     healBar:SetStatusBarTexture(FILL_TEXTURE)
     healBar:SetStatusBarColor(
@@ -388,18 +382,12 @@ local function CreatePredictionBars(container, overlay, unit)
         HEAL_COLOR[3],
         HEAL_COLOR[4]
     )
-    healBar:SetAllPoints(healTrack)
     healBar:SetFrameStrata(STRATA)
     healBar:SetFrameLevel(HEAL_LEVEL)
+    healBar:SetPoint("LEFT", fill, "RIGHT")
+    healBar:SetHeight(SUB_BAR_HEIGHT)
 
-    local absorbTrack = CreateFrame("Frame", nil, container)
-    absorbTrack:SetFrameStrata(STRATA)
-    absorbTrack:SetFrameLevel(ABSORB_LEVEL)
-    absorbTrack:SetPoint("LEFT", healBar:GetStatusBarTexture(), "RIGHT")
-    absorbTrack:SetPoint("RIGHT", overlay, "RIGHT")
-    absorbTrack:SetHeight(SUB_BAR_HEIGHT)
-
-    local absorbBar = CreateFrame("StatusBar", nil, absorbTrack)
+    local absorbBar = CreateFrame("StatusBar", nil, container)
     absorbBar:EnableMouse(false)
     absorbBar:SetStatusBarTexture(FILL_TEXTURE)
     absorbBar:SetStatusBarColor(
@@ -408,44 +396,59 @@ local function CreatePredictionBars(container, overlay, unit)
         ABSORB_COLOR[3],
         ABSORB_COLOR[4]
     )
-    absorbBar:SetAllPoints(absorbTrack)
     absorbBar:SetFrameStrata(STRATA)
     absorbBar:SetFrameLevel(ABSORB_LEVEL)
+    absorbBar:SetPoint("LEFT", healBar:GetStatusBarTexture(), "RIGHT")
+    absorbBar:SetHeight(SUB_BAR_HEIGHT)
+
+    local function ApplyWidth()
+        local width = SafeMeasure(function()
+            return overlay:GetWidth()
+        end)
+
+        if width and width > 0 then
+            barWidth = width
+        end
+
+        if barWidth > 0 then
+            healBar:SetWidth(barWidth)
+            absorbBar:SetWidth(barWidth)
+        end
+    end
 
     local function Update()
         if not UnitExists(unit) then
-            healTrack:Hide()
-            absorbTrack:Hide()
+            healBar:Hide()
+            absorbBar:Hide()
             return
         end
 
-        UnitGetDetailedHealPrediction(unit, nil, calc)
+        ApplyWidth()
 
-        local missing = calc:GetMissingHealth()
-        local incoming = calc:GetIncomingHeals()
-        local damageAbsorbs = calc:GetDamageAbsorbs()
+        -- Same calls as UnitFrameHealPredictionBars_Update (lines 255-256).
+        -- No arithmetic is done on these values.
+        local incoming = UnitGetIncomingHeals(unit) or 0
+        local absorbs = UnitGetTotalAbsorbs(unit) or 0
+        local maxHealth = UnitHealthMax(unit)
 
-        -- Values go straight into the bars, with no arithmetic on them.
-        -- pcall stops a failure here from breaking the addon.
         local ok = pcall(function()
-            healBar:SetMinMaxValues(0, missing)
+            healBar:SetMinMaxValues(0, maxHealth)
             healBar:SetValue(incoming)
-            absorbBar:SetMinMaxValues(0, missing)
-            absorbBar:SetValue(damageAbsorbs)
+            absorbBar:SetMinMaxValues(0, maxHealth)
+            absorbBar:SetValue(absorbs)
         end)
 
         if ok then
-            healTrack:Show()
-            absorbTrack:Show()
+            healBar:Show()
+            absorbBar:Show()
         else
-            healTrack:Hide()
-            absorbTrack:Hide()
+            healBar:Hide()
+            absorbBar:Hide()
         end
     end
 
     return Update
 end
-
 -- ===== Player health bar =====
 do
     local unit = "player"
