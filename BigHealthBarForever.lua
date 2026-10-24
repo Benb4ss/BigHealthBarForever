@@ -627,7 +627,7 @@ do
             end
         end)
 
-        if ok and r then
+        if ok and r and g and b then
             overlay:SetStatusBarColor(r, g, b)
         else
             overlay:SetStatusBarColor(UnitSelectionColor(unit, false))
