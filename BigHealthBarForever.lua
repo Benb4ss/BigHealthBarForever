@@ -1,6 +1,8 @@
 -- Big player and target health bars.
 -- Custom StatusBars over Blizzard's health bars.
 
+local ADDON = ...
+
 -- ===== Shared tuning =====
 local WIDTH_ADJUST = 4
 local HEIGHT = 75
@@ -32,6 +34,30 @@ local NAME_OFFSET_Y = -36
 local HEALTH_TEXT_POINT = "RIGHT"
 local HEALTH_TEXT_X = -3
 local HEALTH_TEXT_Y = -10
+
+local MANA_TEXT_POINT = "RIGHT"
+local MANA_TEXT_X = -3
+local MANA_TEXT_Y = 0
+
+-- Text formats, chosen per unit in /bhf.
+local FORMATS = {
+    {"current",    "Current"},
+    {"currentMax", "Current / Max"},
+    {"missing",    "Missing"},
+    {"missingMax", "Missing / Max"},
+}
+local DEFAULT_FORMAT = "current"
+
+-- Per-character settings. Replaced by the saved table on ADDON_LOADED.
+local charDb = {
+    playerFormat = DEFAULT_FORMAT,
+    targetFormat = DEFAULT_FORMAT,
+    playerManaFormat = DEFAULT_FORMAT,
+    targetManaFormat = DEFAULT_FORMAT,
+}
+
+-- Refresh function for each bar, so the options panel can refresh them.
+local refreshers = {}
 
 -- ===== Shared helpers =====
 local function HideBlizzardName(...)
@@ -233,6 +259,44 @@ local function CreateBackground(parent)
     return background
 end
 
+-- Builds the numericDisplayTransformFunc for a TextStatusBar. getFormat()
+-- returns the chosen format. getMissing() returns the missing amount, or
+-- nil when it can't be read (secret in combat). Follows
+-- TextStatusBarMixin:UpdateTextStringWithValues (transform hook) and
+-- TextStatusBarMixin:GetNumericDisplay (disableMaxValue).
+local function MakeTransform(holder, getFormat, getMissing)
+    return function(value, valueMax)
+        local format = getFormat()
+
+        if format == "currentMax" then
+            holder.disableMaxValue = false
+            return AbbreviateLargeNumbers(value), AbbreviateLargeNumbers(valueMax)
+        end
+
+        if format == "missing" or format == "missingMax" then
+            local missing = getMissing()
+
+            if missing then
+                local missingText = missing > 0
+                    and ("-" .. AbbreviateLargeNumbers(missing))
+                    or "0"
+
+                if format == "missingMax" then
+                    holder.disableMaxValue = false
+                    return missingText, AbbreviateLargeNumbers(valueMax)
+                end
+
+                holder.disableMaxValue = true
+                return missingText, valueMax
+            end
+        end
+
+        -- "current", and the fallback when missing is not readable.
+        holder.disableMaxValue = true
+        return AbbreviateLargeNumbers(value), valueMax
+    end
+end
+
 local function CreateOverlay(parent, blizzBar, blizzMask, globalName)
     local overlay = CreateFrame("StatusBar", globalName, parent)
     overlay:EnableMouse(false)
@@ -279,6 +343,9 @@ local function CreateOverlay(parent, blizzBar, blizzMask, globalName)
     )
     nameText:SetWordWrap(false)
 
+    -- Health text: main text plus left and right text for the "Both"
+    -- display mode, the same three FontStrings Blizzard's health bar uses
+    -- (PlayerFrame.xml, HealthBar text FontStrings). All three use our position.
     local healthText = overlay:CreateFontString(
         nil,
         "OVERLAY",
@@ -292,6 +359,89 @@ local function CreateOverlay(parent, blizzBar, blizzMask, globalName)
         HEALTH_TEXT_X,
         HEALTH_TEXT_Y
     )
+
+    local rightText = overlay:CreateFontString(
+        nil,
+        "OVERLAY",
+        "TextStatusBarText"
+    )
+
+    rightText:SetPoint(
+        HEALTH_TEXT_POINT,
+        overlay,
+        HEALTH_TEXT_POINT,
+        HEALTH_TEXT_X,
+        HEALTH_TEXT_Y
+    )
+
+    local leftText = overlay:CreateFontString(
+        nil,
+        "OVERLAY",
+        "TextStatusBarText"
+    )
+
+    leftText:SetPoint("LEFT", overlay, "LEFT", 2, HEALTH_TEXT_Y)
+
+    -- Blizzard's status text logic (Blizzard_TextStatusBar/TextStatusBar.lua).
+    -- cvar and textLockable are copied from Blizzard's health bar
+    -- (PlayerFrame.xml HealthBar, TargetFrameStatusBarMixin:OnLoad).
+    -- capNumericDisplay matches UnitFrame_Initialize in UnitFrame.lua.
+    Mixin(overlay, TextStatusBarMixin)
+
+    overlay:SetScript("OnEvent", function(self, event, ...)
+        self:TextStatusBarOnEvent(event, ...)
+    end)
+
+    overlay.controlsShownState = false
+    overlay.capNumericDisplay = true
+    overlay.cvar = blizzBar.cvar
+    overlay.textLockable = blizzBar.textLockable
+    overlay.zeroText = blizzBar.zeroText
+    overlay:SetBarText(healthText, leftText, rightText)
+    overlay:InitializeTextStatusBar()
+
+    -- Health format, chosen per unit in /bhf. The missing value comes from
+    -- UnitHealthMissing, which the API docs mark as SecretReturns, so
+    -- SafeMeasure decides whether it can be used. When it cannot, the text
+    -- falls back to Current.
+    overlay.numericDisplayTransformFunc = MakeTransform(
+        overlay,
+        function()
+            return overlay.healthFormat or DEFAULT_FORMAT
+        end,
+        function()
+            return SafeMeasure(function()
+                return UnitHealthMissing(overlay.unit)
+            end)
+        end
+    )
+
+    -- Hover reveal without taking mouse input, so the mana bar keeps its own
+    -- mouseover. IsMouseOver is a rectangle test, the same way
+    -- Blizzard_GarrisonShipyardUI.lua uses it. HideStatusBarText is called
+    -- directly because Blizzard's OnStatusBarLeave also hides GameTooltip.
+    local hovered = false
+
+    overlay:SetScript("OnUpdate", function(self)
+        local over = self:IsMouseOver()
+
+        if over ~= hovered then
+            hovered = over
+
+            if over then
+                self:ShowStatusBarText()
+            else
+                self:HideStatusBarText()
+            end
+        end
+    end)
+
+    overlay:SetScript("OnHide", function(self)
+        if hovered then
+            hovered = false
+            self:HideStatusBarText()
+        end
+    end)
 
     blizzBar:SetAlpha(0)
 
@@ -324,27 +474,36 @@ local function ApplyLayout(overlay, blizzBar)
     overlay:SetFrameLevel(LEVEL)
 end
 
+local function FormatFor(unit)
+    if unit == "player" then
+        return charDb.playerFormat or DEFAULT_FORMAT
+    end
+
+    if unit == "target" then
+        return charDb.targetFormat or DEFAULT_FORMAT
+    end
+
+    return DEFAULT_FORMAT
+end
+
 local function UpdateHealth(overlay, healthText, unit)
     local maxHealth = UnitHealthMax(unit)
     local health = UnitHealth(unit)
 
+    overlay.unit = unit
+    overlay.healthFormat = FormatFor(unit)
+
+    -- Zero-max guard from UnitFrameHealthBar_Update (UnitFrame.lua).
+    overlay.forceHideText = false
+
+    if maxHealth == 0 then
+        maxHealth = 1
+        overlay.forceHideText = true
+    end
+
     overlay:SetMinMaxValues(0, maxHealth)
     overlay:SetValue(health)
-
-    if UnitHealthMissing then
-        healthText:SetText(
-            "-"
-            .. BreakUpLargeNumbers(UnitHealthMissing(unit))
-            .. " / "
-            .. BreakUpLargeNumbers(maxHealth)
-        )
-    else
-        healthText:SetText(
-            BreakUpLargeNumbers(health)
-            .. " / "
-            .. BreakUpLargeNumbers(maxHealth)
-        )
-    end
+    overlay:UpdateTextString()
 end
 
 -- Registers an event without erroring if the client doesn't know the name.
@@ -359,7 +518,7 @@ end
 -- Creates the heal and absorb bars over the health bar.
 --
 -- Both bars are as wide as the health bar and scaled to max health, the
--- same scale Blizzard uses (UnitFrame.lua lines 248, 310, 316). Unlike
+-- same scale Blizzard uses (UnitFrameHealPredictionBars_Update). Unlike
 -- Blizzard, they are not clamped to the bar, so they can run past its
 -- right edge when incoming heals or absorbs exceed missing health.
 -- Each bar starts at the edge of the one before it:
@@ -425,8 +584,8 @@ local function CreatePredictionBars(container, overlay, unit)
 
         ApplyWidth()
 
-        -- Same calls as UnitFrameHealPredictionBars_Update (lines 255-256).
-        -- No arithmetic is done on these values.
+        -- Same calls as UnitFrameHealPredictionBars_Update: UnitGetIncomingHeals
+        -- and UnitGetTotalAbsorbs. No arithmetic is done on these values.
         local incoming = UnitGetIncomingHeals(unit) or 0
         local absorbs = UnitGetTotalAbsorbs(unit) or 0
         local maxHealth = UnitHealthMax(unit)
@@ -449,50 +608,157 @@ local function CreatePredictionBars(container, overlay, unit)
 
     return Update
 end
--- ===== Player health bar =====
-do
-    local unit = "player"
 
-    local playerFrame = PlayerFrame
-    local playerMain =
-        playerFrame.PlayerFrameContent.PlayerFrameContentMain
-    local container = playerMain.HealthBarsContainer
-    local blizzBar = container.HealthBar
-    local blizzMask = container.HealthBarMask
+-- ===== Mana text =====
+-- Blizzard's mana bar keeps its fill. Its own text is hidden, and a
+-- StatusBar proxy with the same TextStatusBar logic draws the text in the
+-- chosen format, the same way the health text works.
+-- Settings are copied from Blizzard's mana bar (PlayerFrame.xml ManaBar,
+-- TargetFrameStatusBarMixin:OnLoad). Blizzard's update is UnitFrameManaBar_Update.
+local function CreateManaText(manaBar, unit, globalName, formatKey)
+    local holder = CreateFrame("StatusBar", globalName, manaBar:GetParent())
+    holder:EnableMouse(false)
+    holder:SetAllPoints(manaBar)
+    holder:SetFrameStrata(STRATA)
+    holder:SetFrameLevel(LEVEL)
 
-    local overlay, nameText, healthText = CreateOverlay(
-        container,
-        blizzBar,
-        blizzMask,
-        "BigPlayerHealthBar"
+    local centerText = holder:CreateFontString(
+        nil,
+        "OVERLAY",
+        "TextStatusBarText"
     )
 
-    local background = CreateBackground(container)
-
-    background:SetPoint("TOPLEFT", overlay, "LEFT", 3, 16)
-    background:SetPoint(
-        "BOTTOMRIGHT",
-        playerMain.ManaBar or overlay,
-        "BOTTOMRIGHT",
-        -3,
-        21
+    centerText:SetPoint(
+        MANA_TEXT_POINT,
+        holder,
+        MANA_TEXT_POINT,
+        MANA_TEXT_X,
+        MANA_TEXT_Y
     )
 
-    -- Hide Blizzard's original health text, name, and prediction bars.
-    if container.HealthBarText then
-        container.HealthBarText:SetAlpha(0)
+    local rightText = holder:CreateFontString(
+        nil,
+        "OVERLAY",
+        "TextStatusBarText"
+    )
+
+    rightText:SetPoint(
+        MANA_TEXT_POINT,
+        holder,
+        MANA_TEXT_POINT,
+        MANA_TEXT_X,
+        MANA_TEXT_Y
+    )
+
+    local leftText = holder:CreateFontString(
+        nil,
+        "OVERLAY",
+        "TextStatusBarText"
+    )
+
+    leftText:SetPoint("LEFT", holder, "LEFT", 2, MANA_TEXT_Y)
+
+    Mixin(holder, TextStatusBarMixin)
+
+    holder:SetScript("OnEvent", function(self, event, ...)
+        self:TextStatusBarOnEvent(event, ...)
+    end)
+
+    holder.controlsShownState = false
+    holder.capNumericDisplay = true
+    holder.cvar = manaBar.cvar
+    holder.textLockable = manaBar.textLockable
+    holder.zeroText = manaBar.zeroText
+    holder:SetBarText(centerText, leftText, rightText)
+    holder:InitializeTextStatusBar()
+
+    holder.numericDisplayTransformFunc = MakeTransform(
+        holder,
+        function()
+            return charDb[formatKey] or DEFAULT_FORMAT
+        end,
+        function()
+            return SafeMeasure(function()
+                return UnitPowerMissing(holder.unit, holder.powerType)
+            end)
+        end
+    )
+
+    -- Hide Blizzard's mana text so only ours shows.
+    if manaBar.ManaBarText then
+        manaBar.ManaBarText:SetAlpha(0)
     end
 
-    HideBlizzardName(playerFrame, playerMain)
-    HideBlizzardPrediction(container, blizzBar)
+    if manaBar.LeftText then
+        manaBar.LeftText:SetAlpha(0)
+    end
 
-    -- Dark background behind the player mana bar.
-    local manaArea = playerMain.ManaBarArea
-    local manaBar = select(1, manaArea:GetChildren())
+    if manaBar.RightText then
+        manaBar.RightText:SetAlpha(0)
+    end
 
+    -- Hover reveal polls the mana bar, so the bar's own mouse input is untouched.
+    local hovered = false
+
+    holder:SetScript("OnUpdate", function(self)
+        local over = manaBar:IsMouseOver()
+
+        if over ~= hovered then
+            hovered = over
+
+            if over then
+                self:ShowStatusBarText()
+            else
+                self:HideStatusBarText()
+            end
+        end
+    end)
+
+    holder:SetScript("OnHide", function(self)
+        if hovered then
+            hovered = false
+            self:HideStatusBarText()
+        end
+    end)
+
+    return function()
+        holder.unit = unit
+        holder.powerType = manaBar.powerType
+
+        local maxPower = UnitPowerMax(unit, holder.powerType)
+        local power = UnitPower(unit, holder.powerType)
+
+        holder:SetMinMaxValues(0, maxPower)
+        holder:SetValue(power)
+        holder:UpdateTextString()
+    end
+end
+
+-- Wraps a mana refresh so an error is reported once per failure streak.
+local function MakeManaUpdater(name, refresh)
+    local reported = false
+
+    return function()
+        local ok, err = pcall(refresh)
+
+        if not ok then
+            if not reported then
+                reported = true
+                print(name .. ": mana text update failed: " .. tostring(err))
+            end
+        else
+            reported = false
+        end
+    end
+end
+
+-- Dark box behind the player's mana bar, created on ManaBarArea so it sits
+-- under the bar's own frame level.
+local function CreateManaBackground(manaArea, manaBar)
     local manaBackground = CreateFrame("Frame", nil, manaArea)
     manaBackground:SetPoint("TOPLEFT", manaBar, "TOPLEFT", -1, 1)
     manaBackground:SetPoint("BOTTOMRIGHT", manaBar, "BOTTOMRIGHT", 1, -1)
+
     -- GetFrameLevel() can also return a secret value in combat.
     local okLevel, level = pcall(function()
         return math.max(0, manaBar:GetFrameLevel() - 1)
@@ -503,85 +769,53 @@ do
     manaTexture:SetAllPoints()
     manaTexture:SetColorTexture(0.05, 0.05, 0.05, 1)
 
-    local UpdatePrediction = CreatePredictionBars(container, overlay, unit)
+    return manaBackground
+end
 
-    local function ApplyColor()
+-- Health bar colour for the player: class colour, or green if none.
+local function ApplyPlayerColor(overlay, unit)
+    local _, token = UnitClass(unit)
+    local color = token and CUSTOM_CLASS_COLORS and CUSTOM_CLASS_COLORS[token]
+        or token and RAID_CLASS_COLORS[token]
+
+    if color then
+        overlay:SetStatusBarColor(color.r, color.g, color.b)
+    else
+        overlay:SetStatusBarColor(0, 1, 0)
+    end
+end
+
+-- Health bar colour for the target: class colour for players, otherwise the
+-- game's reaction colour (UnitSelectionColor).
+local function ApplyTargetColor(overlay, unit)
+    local ok, r, g, b = pcall(function()
+        if not UnitIsPlayer(unit) then
+            return nil
+        end
+
         local _, token = UnitClass(unit)
         local color = token and CUSTOM_CLASS_COLORS and CUSTOM_CLASS_COLORS[token]
             or token and RAID_CLASS_COLORS[token]
 
         if color then
-            overlay:SetStatusBarColor(color.r, color.g, color.b)
-        else
-            overlay:SetStatusBarColor(0, 1, 0)
+            return color.r, color.g, color.b
         end
-    end
-
-    local function Update()
-        ApplyLayout(overlay, blizzBar)
-        ApplyColor()
-        FitName(overlay, nameText, unit)
-        UpdateHealth(overlay, healthText, unit)
-        UpdatePrediction()
-
-        background:Show()
-        manaBackground:Show()
-        overlay:Show()
-    end
-
-    -- Same recovery wrapper as the target bar: a secret-value error
-    -- during combat must not leave the player bar hidden.
-    local reported = false
-
-    local function SafeUpdate()
-        local ok, err = pcall(Update)
-
-        if not ok then
-            if not reported then
-                reported = true
-                print("BigPlayerHealthBar: update failed: " .. tostring(err))
-            end
-
-            pcall(ApplyLayout, overlay, blizzBar)
-            pcall(function()
-                background:Show()
-                manaBackground:Show()
-                overlay:Show()
-            end)
-        else
-            reported = false
-        end
-    end
-
-    local events = CreateFrame("Frame")
-    events:RegisterEvent("PLAYER_ENTERING_WORLD")
-    events:RegisterEvent("UNIT_HEALTH")
-    events:RegisterEvent("UNIT_MAXHEALTH")
-    events:RegisterEvent("UNIT_NAME_UPDATE")
-    events:RegisterEvent("UNIT_DISPLAYPOWER")
-    SafeRegister(events, "UNIT_HEAL_PREDICTION")
-    SafeRegister(events, "UNIT_ABSORB_AMOUNT_CHANGED")
-
-    events:SetScript("OnEvent", function(_, event, eventUnit)
-        if event ~= "PLAYER_ENTERING_WORLD"
-            and eventUnit ~= unit then
-            return
-        end
-
-        SafeUpdate()
     end)
 
-    SafeUpdate()
+    if ok and r then
+        overlay:SetStatusBarColor(r, g, b)
+    else
+        overlay:SetStatusBarColor(UnitSelectionColor(unit, false))
+    end
 end
 
--- ===== Target health bar =====
-do
-    local unit = "target"
-
-    local targetFrame = TargetFrame
-    local targetMain =
-        targetFrame.TargetFrameContent.TargetFrameContentMain
-    local container = targetMain.HealthBarsContainer
+-- Shared factory for a unit's big health bar. The per-unit differences come
+-- in through config; everything else is the same code for both bars.
+-- Returns SafeUpdate (health, names, prediction, mana) and ManaSafeUpdate.
+local function CreateUnitHealthBar(config)
+    local unit = config.unit
+    local main = config.main
+    local container = main.HealthBarsContainer
     local blizzBar = container.HealthBar
     local blizzMask = container.HealthBarMask
 
@@ -589,7 +823,7 @@ do
         container,
         blizzBar,
         blizzMask,
-        "BigTargetHealthBar"
+        config.name
     )
 
     local background = CreateBackground(container)
@@ -597,41 +831,43 @@ do
     background:SetPoint("TOPLEFT", overlay, "LEFT", 3, 16)
     background:SetPoint(
         "BOTTOMRIGHT",
-        targetMain.ManaBar or overlay,
+        config.backgroundAnchor(overlay, main),
         "BOTTOMRIGHT",
-        -6,
-        12
+        config.backgroundX,
+        config.backgroundY
     )
 
+    -- Hide Blizzard's original health text, name, and prediction bars.
     if container.HealthBarText then
         container.HealthBarText:SetAlpha(0)
     end
 
-    HideBlizzardName(targetFrame, targetMain)
+    HideBlizzardName(config.frame, main)
     HideBlizzardPrediction(container, blizzBar)
+
+    local manaBar = config.getManaBar(main)
+
+    local manaBackground = nil
+
+    if config.hasManaBackground then
+        manaBackground = CreateManaBackground(main.ManaBarArea, manaBar)
+    end
 
     local UpdatePrediction = CreatePredictionBars(container, overlay, unit)
 
-    local function ApplyColor()
-        local ok, r, g, b = pcall(function()
-            if not UnitIsPlayer(unit) then
-                return nil
-            end
+    local ManaSafeUpdate = MakeManaUpdater(
+        config.manaName,
+        CreateManaText(manaBar, unit, config.manaName, config.manaFormatKey)
+    )
 
-            local _, token = UnitClass(unit)
-            local color = token and CUSTOM_CLASS_COLORS and CUSTOM_CLASS_COLORS[token]
-                or token and RAID_CLASS_COLORS[token]
+    local function ShowAll()
+        background:Show()
 
-            if color then
-                return color.r, color.g, color.b
-            end
-        end)
-
-        if ok and r and g and b then
-            overlay:SetStatusBarColor(r, g, b)
-        else
-            overlay:SetStatusBarColor(UnitSelectionColor(unit, false))
+        if manaBackground then
+            manaBackground:Show()
         end
+
+        overlay:Show()
     end
 
     local function Update()
@@ -643,13 +879,15 @@ do
         end
 
         ApplyLayout(overlay, blizzBar)
-        ApplyColor()
+        config.applyColor(overlay, unit)
         FitName(overlay, nameText, unit)
-        UpdateHealth(overlay, healthText, unit)
-        UpdatePrediction()
 
-        background:Show()
-        overlay:Show()
+        -- Prediction runs before health, so a failure in the health text
+        -- cannot stop the heal and absorb bars from updating.
+        UpdatePrediction()
+        UpdateHealth(overlay, healthText, unit)
+
+        ShowAll()
     end
 
     -- Recovery wrapper: an error must not permanently hide the bar.
@@ -663,54 +901,281 @@ do
         if not ok then
             if not reported then
                 reported = true
-                print("BigTargetHealthBar: update failed: " .. tostring(err))
+                print(config.name .. ": update failed: " .. tostring(err))
             end
 
             local existsOK, exists = pcall(UnitExists, unit)
 
             if existsOK and exists then
-                -- ApplyLayout runs in its own pcall so a secret-value
-                -- error here can never skip the Show calls below. The
-                -- old version bundled them together, which is why the
-                -- bar vanished for the rest of the fight.
+                -- ApplyLayout runs in its own pcall so a secret-value error
+                -- here can never skip the Show calls below. The old version
+                -- bundled them together, which is why the bar vanished for
+                -- the rest of the fight.
                 pcall(ApplyLayout, overlay, blizzBar)
-                pcall(function()
-                    background:Show()
-                    overlay:Show()
-                end)
+                pcall(ShowAll)
             end
         else
             reported = false
         end
+
+        ManaSafeUpdate()
     end
 
+    -- Unit events use RegisterUnitEvent, so this frame does not wake for
+    -- other units. Global events (PLAYER_ENTERING_WORLD and similar) stay plain.
     local events = CreateFrame("Frame")
-    events:RegisterEvent("PLAYER_TARGET_CHANGED")
-    events:RegisterEvent("PLAYER_ENTERING_WORLD")
-    events:RegisterUnitEvent("UNIT_HEALTH", unit)
-    events:RegisterUnitEvent("UNIT_MAXHEALTH", unit)
-    events:RegisterUnitEvent("UNIT_FACTION", unit)
-    events:RegisterUnitEvent("UNIT_NAME_UPDATE", unit)
+
+    for _, event in ipairs(config.globalEvents) do
+        events:RegisterEvent(event)
+    end
+
+    for _, event in ipairs(config.unitEvents) do
+        events:RegisterUnitEvent(event, unit)
+    end
+
     SafeRegister(events, "UNIT_HEAL_PREDICTION", unit)
     SafeRegister(events, "UNIT_ABSORB_AMOUNT_CHANGED", unit)
 
-    events:SetScript("OnEvent", function()
+    events:SetScript("OnEvent", function(_, event)
+        if event == "UNIT_POWER_UPDATE" or event == "UNIT_MAXPOWER" then
+            ManaSafeUpdate()
+            return
+        end
+
         SafeUpdate()
     end)
 
-    -- Failsafe: rerun the full update once per second. Covers missed
-    -- events, mistimed targeting, and any state where the bar ended
-    -- up hidden or covered without an event to recover it.
-    local elapsed = 0
+    -- Optional failsafe: rerun the full update on an interval. Covers missed
+    -- events, mistimed targeting, and any state where the bar ended up hidden
+    -- or covered without an event to recover it.
+    if config.failsafeInterval then
+        local elapsed = 0
 
-    events:SetScript("OnUpdate", function(self, delta)
-        elapsed = elapsed + delta
+        events:SetScript("OnUpdate", function(_, delta)
+            elapsed = elapsed + delta
 
-        if elapsed >= 1 then
-            elapsed = 0
-            SafeUpdate()
+            if elapsed >= config.failsafeInterval then
+                elapsed = 0
+                SafeUpdate()
+            end
+        end)
+    end
+
+    SafeUpdate()
+
+    return {
+        SafeUpdate = SafeUpdate,
+        ManaSafeUpdate = ManaSafeUpdate,
+    }
+end
+
+-- ===== Player health bar =====
+do
+    local bar = CreateUnitHealthBar({
+        unit = "player",
+        name = "BigPlayerHealthBar",
+        frame = PlayerFrame,
+        main = PlayerFrame.PlayerFrameContent.PlayerFrameContentMain,
+
+        -- Background sits on the health overlay on purpose. This keeps the
+        -- current look.
+        backgroundAnchor = function(overlay)
+            return overlay
+        end,
+        backgroundX = -3,
+        backgroundY = 21,
+
+        -- ManaBar sits under ManaBarArea (PlayerFrame.xml). PlayerFrame_GetManaBar
+        -- (PlayerFrame.lua) returns this same object.
+        getManaBar = function(main)
+            return main.ManaBarArea.ManaBar
+        end,
+        hasManaBackground = true,
+
+        manaName = "BigPlayerManaText",
+        manaFormatKey = "playerManaFormat",
+        applyColor = ApplyPlayerColor,
+
+        globalEvents = { "PLAYER_ENTERING_WORLD" },
+        unitEvents = {
+            "UNIT_HEALTH",
+            "UNIT_MAXHEALTH",
+            "UNIT_NAME_UPDATE",
+            "UNIT_DISPLAYPOWER",
+            "UNIT_POWER_UPDATE",
+            "UNIT_MAXPOWER",
+        },
+    })
+
+    refreshers.player = bar.SafeUpdate
+    refreshers.playerMana = bar.ManaSafeUpdate
+end
+
+-- ===== Target health bar =====
+do
+    local bar = CreateUnitHealthBar({
+        unit = "target",
+        name = "BigTargetHealthBar",
+        frame = TargetFrame,
+        main = TargetFrame.TargetFrameContent.TargetFrameContentMain,
+
+        backgroundAnchor = function(overlay, main)
+            return main.ManaBar or overlay
+        end,
+        backgroundX = -6,
+        backgroundY = 12,
+
+        getManaBar = function(main)
+            return main.ManaBar
+        end,
+        hasManaBackground = false,
+
+        manaName = "BigTargetManaText",
+        manaFormatKey = "targetManaFormat",
+        applyColor = ApplyTargetColor,
+
+        globalEvents = { "PLAYER_TARGET_CHANGED", "PLAYER_ENTERING_WORLD" },
+        unitEvents = {
+            "UNIT_HEALTH",
+            "UNIT_MAXHEALTH",
+            "UNIT_FACTION",
+            "UNIT_NAME_UPDATE",
+            "UNIT_POWER_UPDATE",
+            "UNIT_MAXPOWER",
+        },
+
+        -- Failsafe: rerun the full update once per second.
+        failsafeInterval = 1,
+    })
+
+    refreshers.target = bar.SafeUpdate
+    refreshers.targetMana = bar.ManaSafeUpdate
+end
+
+-- ===== Options (/bhf) =====
+-- Layout follows StatusTextFormat.lua: a Settings canvas category, dropdowns
+-- built with SetupMenu and CreateRadio (Blizzard_Menu MenuImplementationGuide),
+-- and Settings.OpenToCategory(category:GetID()).
+
+local function RefreshAll()
+    for _, refresh in pairs(refreshers) do
+        refresh()
+    end
+end
+
+local function CreateDropdown(panel, anchor, key)
+    local dropdown = CreateFrame("DropdownButton", nil, panel, "WowStyle1DropdownTemplate")
+    dropdown:SetPoint("TOPLEFT", anchor, "BOTTOMLEFT", 0, -6)
+    dropdown:SetWidth(200)
+    dropdown:SetupMenu(function(_, root)
+        for _, entry in ipairs(FORMATS) do
+            local value, label = entry[1], entry[2]
+            root:CreateRadio(label,
+                function() return charDb[key] == value end,
+                function()
+                    charDb[key] = value
+                    RefreshAll()
+                end,
+                value)
         end
     end)
 
-    SafeUpdate()
+    return dropdown
 end
+
+local function CreateOptions()
+    local panel = CreateFrame("Frame")
+    panel.name = "BigHealthBarForever"
+
+    local title = panel:CreateFontString(nil, "ARTWORK", "GameFontNormalLarge")
+    title:SetPoint("TOPLEFT", 16, -16)
+    title:SetText("BigHealthBarForever")
+
+    -- Distance from the left edge of one column to the next.
+    local COLUMN_WIDTH = 260
+
+    local columns = {
+        {
+            header = "Player",
+            rows = {
+                {"playerFormat",     "Health text:"},
+                {"playerManaFormat", "Mana text:"},
+            },
+        },
+        {
+            header = "Target",
+            rows = {
+                {"targetFormat",     "Health text:"},
+                {"targetManaFormat", "Mana text:"},
+            },
+        },
+    }
+
+    local columnEnds = {}
+
+    for col, column in ipairs(columns) do
+        local left = 16 + (col - 1) * COLUMN_WIDTH
+
+        local header = panel:CreateFontString(nil, "ARTWORK", "GameFontNormal")
+        header:SetPoint("TOPLEFT", title, "BOTTOMLEFT", left - 16, -24)
+        header:SetText(column.header)
+
+        local anchor = header
+
+        for _, row in ipairs(column.rows) do
+            local label = panel:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
+            label:SetPoint("TOPLEFT", anchor, "BOTTOMLEFT", 0, -20)
+            label:SetText(row[2])
+            anchor = CreateDropdown(panel, label, row[1])
+        end
+
+        columnEnds[col] = anchor
+    end
+
+    local note = panel:CreateFontString(nil, "ARTWORK", "GameFontDisableSmall")
+    note:SetPoint("TOPLEFT", columnEnds[1], "BOTTOMLEFT", 0, -12)
+    note:SetText("Missing falls back to Current in combat when the game hides the value.")
+
+    local command = panel:CreateFontString(nil, "ARTWORK", "GameFontDisableSmall")
+    command:SetPoint("TOPLEFT", note, "BOTTOMLEFT", 0, -6)
+    command:SetText("Type /bhf to open this panel.")
+
+    local category = Settings.RegisterCanvasLayoutCategory(panel, panel.name)
+    Settings.RegisterAddOnCategory(category)
+
+    SLASH_BIGHEALTHBARFOREVER1 = "/bhf"
+    SlashCmdList.BIGHEALTHBARFOREVER = function()
+        Settings.OpenToCategory(category:GetID())
+    end
+end
+
+local loader = CreateFrame("Frame")
+loader:RegisterEvent("ADDON_LOADED")
+loader:SetScript("OnEvent", function(self, _, name)
+    if name ~= ADDON then return end
+
+    -- Saved per character. Fill in missing values and reject unknown
+    -- formats, as StatusTextFormat.lua does.
+    BigHealthBarForeverCharDB = BigHealthBarForeverCharDB or {}
+    local saved = BigHealthBarForeverCharDB
+
+    for _, key in ipairs({ "playerFormat", "targetFormat", "playerManaFormat", "targetManaFormat" }) do
+        local valid = false
+
+        for _, entry in ipairs(FORMATS) do
+            if entry[1] == saved[key] then
+                valid = true
+            end
+        end
+
+        if not valid then
+            saved[key] = DEFAULT_FORMAT
+        end
+    end
+
+    charDb = saved
+
+    CreateOptions()
+    RefreshAll()
+    self:UnregisterEvent("ADDON_LOADED")
+end)

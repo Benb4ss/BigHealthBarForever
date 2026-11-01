@@ -4,5 +4,6 @@
 ## Author:  Benbass
 ## IconTexture: Interface\AddOns\BigHealthBarForever\logo
 ## Category: Unit Frames
+## SavedVariablesPerCharacter: BigHealthBarForeverCharDB
 
 BigHealthBarForever.lua
