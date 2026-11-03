@@ -48,12 +48,34 @@ local FORMATS = {
 }
 local DEFAULT_FORMAT = "current"
 
+-- Numeric status text position, chosen per unit in /bhf. The percentage
+-- in Both mode always stays on the left.
+local TEXT_POSITIONS = {
+    {"LEFT",   "Left"},
+    {"CENTER", "Center"},
+    {"RIGHT",  "Right"},
+}
+local DEFAULT_TEXT_POSITION = "RIGHT"
+
+-- Blizzard's Status Text setting (Interface > Display). The CVar name and
+-- values come from TextStatusBar.lua (STATUS_TEXT_DISPLAY_MODE) and are
+-- set from Interface.lua with SetCVar.
+local STATUS_TEXT_CVAR = "statusTextDisplay"
+local STATUS_TEXT_OPTIONS = {
+    {"NUMERIC", "Numeric Value"},
+    {"PERCENT", "Percentage"},
+    {"BOTH",    "Both"},
+    {"NONE",    "None"},
+}
+
 -- Per-character settings. Replaced by the saved table on ADDON_LOADED.
 local charDb = {
     playerFormat = DEFAULT_FORMAT,
     targetFormat = DEFAULT_FORMAT,
     playerManaFormat = DEFAULT_FORMAT,
     targetManaFormat = DEFAULT_FORMAT,
+    playerTextPosition = DEFAULT_TEXT_POSITION,
+    targetTextPosition = DEFAULT_TEXT_POSITION,
 }
 
 -- Refresh function for each bar, so the options panel can refresh them.
@@ -345,7 +367,9 @@ local function CreateOverlay(parent, blizzBar, blizzMask, globalName)
 
     -- Health text: main text plus left and right text for the "Both"
     -- display mode, the same three FontStrings Blizzard's health bar uses
-    -- (PlayerFrame.xml, HealthBar text FontStrings). All three use our position.
+    -- (PlayerFrame.xml, HealthBar text FontStrings). The left text is the
+    -- percentage and always stays on the left. The main and right text are
+    -- the numeric value and move with the chosen position (PlaceNumericText).
     local healthText = overlay:CreateFontString(
         nil,
         "OVERLAY",
@@ -486,6 +510,39 @@ local function FormatFor(unit)
     return DEFAULT_FORMAT
 end
 
+-- Position of the numeric status text, chosen per unit in /bhf.
+local function PositionFor(unit)
+    if unit == "player" then
+        return charDb.playerTextPosition or DEFAULT_TEXT_POSITION
+    end
+
+    if unit == "target" then
+        return charDb.targetTextPosition or DEFAULT_TEXT_POSITION
+    end
+
+    return DEFAULT_TEXT_POSITION
+end
+
+-- Moves a numeric status text to the chosen position. Left sits just after
+-- the percentage (percentText), so the two never overlap in Both mode.
+-- Re-anchors only when the position changes.
+local function PlaceNumericText(numeric, bar, percentText, position, x, y)
+    if numeric.textPosition == position then
+        return
+    end
+
+    numeric.textPosition = position
+    numeric:ClearAllPoints()
+
+    if position == "LEFT" then
+        numeric:SetPoint("LEFT", percentText, "RIGHT", 4, 0)
+    elseif position == "CENTER" then
+        numeric:SetPoint("CENTER", bar, "CENTER", 0, y)
+    else
+        numeric:SetPoint("RIGHT", bar, "RIGHT", x, y)
+    end
+end
+
 local function UpdateHealth(overlay, healthText, unit)
     local maxHealth = UnitHealthMax(unit)
     local health = UnitHealth(unit)
@@ -503,6 +560,13 @@ local function UpdateHealth(overlay, healthText, unit)
 
     overlay:SetMinMaxValues(0, maxHealth)
     overlay:SetValue(health)
+
+    -- Numeric text: main (Numeric, Percent, None) and right (Both).
+    -- Left (the percentage in Both) is overlay.LeftText, set by SetBarText.
+    local position = PositionFor(unit)
+    PlaceNumericText(healthText, overlay, overlay.LeftText, position, HEALTH_TEXT_X, HEALTH_TEXT_Y)
+    PlaceNumericText(overlay.RightText, overlay, overlay.LeftText, position, HEALTH_TEXT_X, HEALTH_TEXT_Y)
+
     overlay:UpdateTextString()
 end
 
@@ -730,6 +794,12 @@ local function CreateManaText(manaBar, unit, globalName, formatKey)
 
         holder:SetMinMaxValues(0, maxPower)
         holder:SetValue(power)
+
+        -- Numeric text follows the unit's position; the percentage stays left.
+        local position = PositionFor(unit)
+        PlaceNumericText(centerText, holder, leftText, position, MANA_TEXT_X, MANA_TEXT_Y)
+        PlaceNumericText(rightText, holder, leftText, position, MANA_TEXT_X, MANA_TEXT_Y)
+
         holder:UpdateTextString()
     end
 end
@@ -1063,17 +1133,40 @@ local function RefreshAll()
     end
 end
 
-local function CreateDropdown(panel, anchor, key)
+local function CreateDropdown(panel, anchor, key, entries)
     local dropdown = CreateFrame("DropdownButton", nil, panel, "WowStyle1DropdownTemplate")
     dropdown:SetPoint("TOPLEFT", anchor, "BOTTOMLEFT", 0, -6)
     dropdown:SetWidth(200)
     dropdown:SetupMenu(function(_, root)
-        for _, entry in ipairs(FORMATS) do
+        for _, entry in ipairs(entries) do
             local value, label = entry[1], entry[2]
             root:CreateRadio(label,
                 function() return charDb[key] == value end,
                 function()
                     charDb[key] = value
+                    RefreshAll()
+                end,
+                value)
+        end
+    end)
+
+    return dropdown
+end
+
+-- Blizzard's Status Text setter (Interface.lua, SetValue). It sets the mode
+-- and the lock CVar "statusText": "1" keeps the text shown, "0" (None) hides it.
+local function CreateStatusTextDropdown(panel, anchor)
+    local dropdown = CreateFrame("DropdownButton", nil, panel, "WowStyle1DropdownTemplate")
+    dropdown:SetPoint("TOPLEFT", anchor, "BOTTOMLEFT", 0, -6)
+    dropdown:SetWidth(200)
+    dropdown:SetupMenu(function(_, root)
+        for _, entry in ipairs(STATUS_TEXT_OPTIONS) do
+            local value, label = entry[1], entry[2]
+            root:CreateRadio(label,
+                function() return GetCVar(STATUS_TEXT_CVAR) == value end,
+                function()
+                    SetCVar(STATUS_TEXT_CVAR, value)
+                    SetCVar("statusText", value == "NONE" and "0" or "1")
                     RefreshAll()
                 end,
                 value)
@@ -1091,6 +1184,13 @@ local function CreateOptions()
     title:SetPoint("TOPLEFT", 16, -16)
     title:SetText("BigHealthBarForever")
 
+    -- Status Text sits above the columns.
+    local statusLabel = panel:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
+    statusLabel:SetPoint("TOPLEFT", title, "BOTTOMLEFT", 0, -24)
+    statusLabel:SetText("Status Text:")
+
+    local statusDropdown = CreateStatusTextDropdown(panel, statusLabel)
+
     -- Distance from the left edge of one column to the next.
     local COLUMN_WIDTH = 260
 
@@ -1098,15 +1198,17 @@ local function CreateOptions()
         {
             header = "Player",
             rows = {
-                {"playerFormat",     "Health text:"},
-                {"playerManaFormat", "Mana text:"},
+                {"playerFormat",       "Health text:"},
+                {"playerManaFormat",   "Mana text:"},
+                {"playerTextPosition", "Text position:", TEXT_POSITIONS},
             },
         },
         {
             header = "Target",
             rows = {
-                {"targetFormat",     "Health text:"},
-                {"targetManaFormat", "Mana text:"},
+                {"targetFormat",       "Health text:"},
+                {"targetManaFormat",   "Mana text:"},
+                {"targetTextPosition", "Text position:", TEXT_POSITIONS},
             },
         },
     }
@@ -1117,7 +1219,7 @@ local function CreateOptions()
         local left = 16 + (col - 1) * COLUMN_WIDTH
 
         local header = panel:CreateFontString(nil, "ARTWORK", "GameFontNormal")
-        header:SetPoint("TOPLEFT", title, "BOTTOMLEFT", left - 16, -24)
+        header:SetPoint("TOPLEFT", statusDropdown, "BOTTOMLEFT", left - 16, -24)
         header:SetText(column.header)
 
         local anchor = header
@@ -1126,7 +1228,7 @@ local function CreateOptions()
             local label = panel:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
             label:SetPoint("TOPLEFT", anchor, "BOTTOMLEFT", 0, -20)
             label:SetText(row[2])
-            anchor = CreateDropdown(panel, label, row[1])
+            anchor = CreateDropdown(panel, label, row[1], row[3] or FORMATS)
         end
 
         columnEnds[col] = anchor
@@ -1134,7 +1236,6 @@ local function CreateOptions()
 
     local note = panel:CreateFontString(nil, "ARTWORK", "GameFontDisableSmall")
     note:SetPoint("TOPLEFT", columnEnds[1], "BOTTOMLEFT", 0, -12)
-    note:SetText("Missing falls back to Current in combat when the game hides the value.")
 
     local command = panel:CreateFontString(nil, "ARTWORK", "GameFontDisableSmall")
     command:SetPoint("TOPLEFT", note, "BOTTOMLEFT", 0, -6)
@@ -1155,7 +1256,7 @@ loader:SetScript("OnEvent", function(self, _, name)
     if name ~= ADDON then return end
 
     -- Saved per character. Fill in missing values and reject unknown
-    -- formats, as StatusTextFormat.lua does.
+    -- formats and positions, as StatusTextFormat.lua does.
     BigHealthBarForeverCharDB = BigHealthBarForeverCharDB or {}
     local saved = BigHealthBarForeverCharDB
 
@@ -1170,6 +1271,20 @@ loader:SetScript("OnEvent", function(self, _, name)
 
         if not valid then
             saved[key] = DEFAULT_FORMAT
+        end
+    end
+
+    for _, key in ipairs({ "playerTextPosition", "targetTextPosition" }) do
+        local valid = false
+
+        for _, entry in ipairs(TEXT_POSITIONS) do
+            if entry[1] == saved[key] then
+                valid = true
+            end
+        end
+
+        if not valid then
+            saved[key] = DEFAULT_TEXT_POSITION
         end
     end
 
