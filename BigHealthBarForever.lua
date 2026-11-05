@@ -1,5 +1,11 @@
 -- Big player and target health bars.
 -- Custom StatusBars over Blizzard's health bars.
+--
+-- Text rule: addon code never compares or does arithmetic on game numbers
+-- (they can be secret in combat). Text is built only with
+-- AbbreviateLargeNumbers (allowed on secret values) and string joining.
+-- Blizzard's TextStatusBarMixin is not used, because its comparisons fail
+-- in addon code during combat (TextStatusBar.lua UpdateTextStringWithValues).
 
 local ADDON = ...
 
@@ -48,34 +54,12 @@ local FORMATS = {
 }
 local DEFAULT_FORMAT = "current"
 
--- Numeric status text position, chosen per unit in /bhf. The percentage
--- in Both mode always stays on the left.
-local TEXT_POSITIONS = {
-    {"LEFT",   "Left"},
-    {"CENTER", "Center"},
-    {"RIGHT",  "Right"},
-}
-local DEFAULT_TEXT_POSITION = "RIGHT"
-
--- Blizzard's Status Text setting (Interface > Display). The CVar name and
--- values come from TextStatusBar.lua (STATUS_TEXT_DISPLAY_MODE) and are
--- set from Interface.lua with SetCVar.
-local STATUS_TEXT_CVAR = "statusTextDisplay"
-local STATUS_TEXT_OPTIONS = {
-    {"NUMERIC", "Numeric Value"},
-    {"PERCENT", "Percentage"},
-    {"BOTH",    "Both"},
-    {"NONE",    "None"},
-}
-
 -- Per-character settings. Replaced by the saved table on ADDON_LOADED.
 local charDb = {
     playerFormat = DEFAULT_FORMAT,
     targetFormat = DEFAULT_FORMAT,
     playerManaFormat = DEFAULT_FORMAT,
     targetManaFormat = DEFAULT_FORMAT,
-    playerTextPosition = DEFAULT_TEXT_POSITION,
-    targetTextPosition = DEFAULT_TEXT_POSITION,
 }
 
 -- Refresh function for each bar, so the options panel can refresh them.
@@ -153,6 +137,16 @@ local function SafeMeasure(fn)
     end
 
     return v
+end
+
+-- True only when a game value is exactly 0. A secret value can't be
+-- compared, so that case returns false.
+local function IsExactlyZero(value)
+    local ok, zero = pcall(function()
+        return value == 0
+    end)
+
+    return ok and zero == true
 end
 
 -- Standalone font string for measuring text, created outside
@@ -281,42 +275,103 @@ local function CreateBackground(parent)
     return background
 end
 
--- Builds the numericDisplayTransformFunc for a TextStatusBar. getFormat()
--- returns the chosen format. getMissing() returns the missing amount, or
--- nil when it can't be read (secret in combat). Follows
--- TextStatusBarMixin:UpdateTextStringWithValues (transform hook) and
--- TextStatusBarMixin:GetNumericDisplay (disableMaxValue).
-local function MakeTransform(holder, getFormat, getMissing)
-    return function(value, valueMax)
-        local format = getFormat()
+-- ===== Status text (no Blizzard text mixin) =====
 
+-- "-missing" text. A secret value can't be compared, so the "0" case is
+-- only used when the value can be read.
+local function MissingText(missing)
+    local okPositive, positive = pcall(function()
+        return missing > 0
+    end)
+
+    if okPositive and not positive then
+        return "0"
+    end
+
+    return "-" .. AbbreviateLargeNumbers(missing)
+end
+
+-- Builds the text for one format. source.value(), source.max() and
+-- source.missing() return game numbers, which may be secret. If the
+-- chosen format can't be built, falls back to the current value. If even
+-- that fails, returns an empty string.
+local function BuildStatusText(format, source)
+    local ok, text = pcall(function()
         if format == "currentMax" then
-            holder.disableMaxValue = false
-            return AbbreviateLargeNumbers(value), AbbreviateLargeNumbers(valueMax)
+            return AbbreviateLargeNumbers(source.value())
+                .. " / "
+                .. AbbreviateLargeNumbers(source.max())
         end
 
         if format == "missing" or format == "missingMax" then
-            local missing = getMissing()
+            local missingText = MissingText(source.missing())
 
-            if missing then
-                local missingText = missing > 0
-                    and ("-" .. AbbreviateLargeNumbers(missing))
-                    or "0"
-
-                if format == "missingMax" then
-                    holder.disableMaxValue = false
-                    return missingText, AbbreviateLargeNumbers(valueMax)
-                end
-
-                holder.disableMaxValue = true
-                return missingText, valueMax
+            if format == "missingMax" then
+                return missingText
+                    .. " / "
+                    .. AbbreviateLargeNumbers(source.max())
             end
+
+            return missingText
         end
 
-        -- "current", and the fallback when missing is not readable.
-        holder.disableMaxValue = true
-        return AbbreviateLargeNumbers(value), valueMax
+        return AbbreviateLargeNumbers(source.value())
+    end)
+
+    if ok then
+        return text
     end
+
+    local okCurrent, current = pcall(function()
+        return AbbreviateLargeNumbers(source.value())
+    end)
+
+    if okCurrent then
+        return current
+    end
+
+    return ""
+end
+
+-- Attaches status text to a bar. host is the StatusBar that runs the
+-- OnUpdate and OnHide handlers. hoverFrame is the frame whose mouseover
+-- reveals the text. Hover uses a rectangle test (IsMouseOver), so no mouse
+-- input is taken from Blizzard's bars.
+-- Visibility follows the Status Text option (cvar "statusText") and hover,
+-- as Blizzard's bars do (TextStatusBar.lua). Sets host.RefreshStatusText.
+local function AttachStatusText(host, hoverFrame, fontString, getFormat, source)
+    local hovered = false
+
+    local function Refresh()
+        local shouldShow = (GetCVar("statusText") == "1" or hovered)
+            and not source.forceHide()
+
+        if not shouldShow then
+            fontString:Hide()
+            return
+        end
+
+        fontString:SetText(BuildStatusText(getFormat(), source))
+        fontString:Show()
+    end
+
+    host.RefreshStatusText = Refresh
+
+    host:SetScript("OnUpdate", function()
+        local over = hoverFrame:IsMouseOver()
+
+        if over ~= hovered then
+            hovered = over
+            Refresh()
+        end
+    end)
+
+    host:SetScript("OnHide", function()
+        if hovered then
+            hovered = false
+            Refresh()
+        end
+    end)
 end
 
 local function CreateOverlay(parent, blizzBar, blizzMask, globalName)
@@ -365,11 +420,7 @@ local function CreateOverlay(parent, blizzBar, blizzMask, globalName)
     )
     nameText:SetWordWrap(false)
 
-    -- Health text: main text plus left and right text for the "Both"
-    -- display mode, the same three FontStrings Blizzard's health bar uses
-    -- (PlayerFrame.xml, HealthBar text FontStrings). The left text is the
-    -- percentage and always stays on the left. The main and right text are
-    -- the numeric value and move with the chosen position (PlaceNumericText).
+    -- Health text, at our own position (not Blizzard's).
     local healthText = overlay:CreateFontString(
         nil,
         "OVERLAY",
@@ -383,89 +434,6 @@ local function CreateOverlay(parent, blizzBar, blizzMask, globalName)
         HEALTH_TEXT_X,
         HEALTH_TEXT_Y
     )
-
-    local rightText = overlay:CreateFontString(
-        nil,
-        "OVERLAY",
-        "TextStatusBarText"
-    )
-
-    rightText:SetPoint(
-        HEALTH_TEXT_POINT,
-        overlay,
-        HEALTH_TEXT_POINT,
-        HEALTH_TEXT_X,
-        HEALTH_TEXT_Y
-    )
-
-    local leftText = overlay:CreateFontString(
-        nil,
-        "OVERLAY",
-        "TextStatusBarText"
-    )
-
-    leftText:SetPoint("LEFT", overlay, "LEFT", 2, HEALTH_TEXT_Y)
-
-    -- Blizzard's status text logic (Blizzard_TextStatusBar/TextStatusBar.lua).
-    -- cvar and textLockable are copied from Blizzard's health bar
-    -- (PlayerFrame.xml HealthBar, TargetFrameStatusBarMixin:OnLoad).
-    -- capNumericDisplay matches UnitFrame_Initialize in UnitFrame.lua.
-    Mixin(overlay, TextStatusBarMixin)
-
-    overlay:SetScript("OnEvent", function(self, event, ...)
-        self:TextStatusBarOnEvent(event, ...)
-    end)
-
-    overlay.controlsShownState = false
-    overlay.capNumericDisplay = true
-    overlay.cvar = blizzBar.cvar
-    overlay.textLockable = blizzBar.textLockable
-    overlay.zeroText = blizzBar.zeroText
-    overlay:SetBarText(healthText, leftText, rightText)
-    overlay:InitializeTextStatusBar()
-
-    -- Health format, chosen per unit in /bhf. The missing value comes from
-    -- UnitHealthMissing, which the API docs mark as SecretReturns, so
-    -- SafeMeasure decides whether it can be used. When it cannot, the text
-    -- falls back to Current.
-    overlay.numericDisplayTransformFunc = MakeTransform(
-        overlay,
-        function()
-            return overlay.healthFormat or DEFAULT_FORMAT
-        end,
-        function()
-            return SafeMeasure(function()
-                return UnitHealthMissing(overlay.unit)
-            end)
-        end
-    )
-
-    -- Hover reveal without taking mouse input, so the mana bar keeps its own
-    -- mouseover. IsMouseOver is a rectangle test, the same way
-    -- Blizzard_GarrisonShipyardUI.lua uses it. HideStatusBarText is called
-    -- directly because Blizzard's OnStatusBarLeave also hides GameTooltip.
-    local hovered = false
-
-    overlay:SetScript("OnUpdate", function(self)
-        local over = self:IsMouseOver()
-
-        if over ~= hovered then
-            hovered = over
-
-            if over then
-                self:ShowStatusBarText()
-            else
-                self:HideStatusBarText()
-            end
-        end
-    end)
-
-    overlay:SetScript("OnHide", function(self)
-        if hovered then
-            hovered = false
-            self:HideStatusBarText()
-        end
-    end)
 
     blizzBar:SetAlpha(0)
 
@@ -498,76 +466,21 @@ local function ApplyLayout(overlay, blizzBar)
     overlay:SetFrameLevel(LEVEL)
 end
 
-local function FormatFor(unit)
-    if unit == "player" then
-        return charDb.playerFormat or DEFAULT_FORMAT
-    end
-
-    if unit == "target" then
-        return charDb.targetFormat or DEFAULT_FORMAT
-    end
-
-    return DEFAULT_FORMAT
-end
-
--- Position of the numeric status text, chosen per unit in /bhf.
-local function PositionFor(unit)
-    if unit == "player" then
-        return charDb.playerTextPosition or DEFAULT_TEXT_POSITION
-    end
-
-    if unit == "target" then
-        return charDb.targetTextPosition or DEFAULT_TEXT_POSITION
-    end
-
-    return DEFAULT_TEXT_POSITION
-end
-
--- Moves a numeric status text to the chosen position. Left sits just after
--- the percentage (percentText), so the two never overlap in Both mode.
--- Re-anchors only when the position changes.
-local function PlaceNumericText(numeric, bar, percentText, position, x, y)
-    if numeric.textPosition == position then
-        return
-    end
-
-    numeric.textPosition = position
-    numeric:ClearAllPoints()
-
-    if position == "LEFT" then
-        numeric:SetPoint("LEFT", percentText, "RIGHT", 4, 0)
-    elseif position == "CENTER" then
-        numeric:SetPoint("CENTER", bar, "CENTER", 0, y)
-    else
-        numeric:SetPoint("RIGHT", bar, "RIGHT", x, y)
-    end
-end
-
-local function UpdateHealth(overlay, healthText, unit)
+local function UpdateHealth(overlay, unit)
     local maxHealth = UnitHealthMax(unit)
     local health = UnitHealth(unit)
 
-    overlay.unit = unit
-    overlay.healthFormat = FormatFor(unit)
-
-    -- Zero-max guard from UnitFrameHealthBar_Update (UnitFrame.lua).
+    -- Zero-max guard, as in UnitFrameHealthBar_Update (UnitFrame.lua).
     overlay.forceHideText = false
 
-    if maxHealth == 0 then
+    if IsExactlyZero(maxHealth) then
         maxHealth = 1
         overlay.forceHideText = true
     end
 
     overlay:SetMinMaxValues(0, maxHealth)
     overlay:SetValue(health)
-
-    -- Numeric text: main (Numeric, Percent, None) and right (Both).
-    -- Left (the percentage in Both) is overlay.LeftText, set by SetBarText.
-    local position = PositionFor(unit)
-    PlaceNumericText(healthText, overlay, overlay.LeftText, position, HEALTH_TEXT_X, HEALTH_TEXT_Y)
-    PlaceNumericText(overlay.RightText, overlay, overlay.LeftText, position, HEALTH_TEXT_X, HEALTH_TEXT_Y)
-
-    overlay:UpdateTextString()
+    overlay.RefreshStatusText()
 end
 
 -- Registers an event without erroring if the client doesn't know the name.
@@ -649,12 +562,13 @@ local function CreatePredictionBars(container, overlay, unit)
         ApplyWidth()
 
         -- Same calls as UnitFrameHealPredictionBars_Update: UnitGetIncomingHeals
-        -- and UnitGetTotalAbsorbs. No arithmetic is done on these values.
-        local incoming = UnitGetIncomingHeals(unit) or 0
-        local absorbs = UnitGetTotalAbsorbs(unit) or 0
-        local maxHealth = UnitHealthMax(unit)
-
+        -- and UnitGetTotalAbsorbs. Everything is inside one protected call, so
+        -- a secret value here can only hide these two bars, not break the rest.
         local ok = pcall(function()
+            local incoming = UnitGetIncomingHeals(unit) or 0
+            local absorbs = UnitGetTotalAbsorbs(unit) or 0
+            local maxHealth = UnitHealthMax(unit)
+
             healBar:SetMinMaxValues(0, maxHealth)
             healBar:SetValue(incoming)
             absorbBar:SetMinMaxValues(0, maxHealth)
@@ -675,10 +589,9 @@ end
 
 -- ===== Mana text =====
 -- Blizzard's mana bar keeps its fill. Its own text is hidden, and a
--- StatusBar proxy with the same TextStatusBar logic draws the text in the
--- chosen format, the same way the health text works.
+-- StatusBar holder draws our text in the chosen format.
 -- Settings are copied from Blizzard's mana bar (PlayerFrame.xml ManaBar,
--- TargetFrameStatusBarMixin:OnLoad). Blizzard's update is UnitFrameManaBar_Update.
+-- TargetFrameStatusBarMixin:OnLoad).
 local function CreateManaText(manaBar, unit, globalName, formatKey)
     local holder = CreateFrame("StatusBar", globalName, manaBar:GetParent())
     holder:EnableMouse(false)
@@ -700,52 +613,29 @@ local function CreateManaText(manaBar, unit, globalName, formatKey)
         MANA_TEXT_Y
     )
 
-    local rightText = holder:CreateFontString(
-        nil,
-        "OVERLAY",
-        "TextStatusBarText"
-    )
+    local source = {
+        value = function()
+            return UnitPower(unit, manaBar.powerType)
+        end,
+        max = function()
+            return UnitPowerMax(unit, manaBar.powerType)
+        end,
+        missing = function()
+            return UnitPowerMissing(unit, manaBar.powerType)
+        end,
+        forceHide = function()
+            return holder.forceHideText
+        end,
+    }
 
-    rightText:SetPoint(
-        MANA_TEXT_POINT,
+    AttachStatusText(
         holder,
-        MANA_TEXT_POINT,
-        MANA_TEXT_X,
-        MANA_TEXT_Y
-    )
-
-    local leftText = holder:CreateFontString(
-        nil,
-        "OVERLAY",
-        "TextStatusBarText"
-    )
-
-    leftText:SetPoint("LEFT", holder, "LEFT", 2, MANA_TEXT_Y)
-
-    Mixin(holder, TextStatusBarMixin)
-
-    holder:SetScript("OnEvent", function(self, event, ...)
-        self:TextStatusBarOnEvent(event, ...)
-    end)
-
-    holder.controlsShownState = false
-    holder.capNumericDisplay = true
-    holder.cvar = manaBar.cvar
-    holder.textLockable = manaBar.textLockable
-    holder.zeroText = manaBar.zeroText
-    holder:SetBarText(centerText, leftText, rightText)
-    holder:InitializeTextStatusBar()
-
-    holder.numericDisplayTransformFunc = MakeTransform(
-        holder,
+        manaBar,
+        centerText,
         function()
             return charDb[formatKey] or DEFAULT_FORMAT
         end,
-        function()
-            return SafeMeasure(function()
-                return UnitPowerMissing(holder.unit, holder.powerType)
-            end)
-        end
+        source
     )
 
     -- Hide Blizzard's mana text so only ours shows.
@@ -761,46 +651,20 @@ local function CreateManaText(manaBar, unit, globalName, formatKey)
         manaBar.RightText:SetAlpha(0)
     end
 
-    -- Hover reveal polls the mana bar, so the bar's own mouse input is untouched.
-    local hovered = false
-
-    holder:SetScript("OnUpdate", function(self)
-        local over = manaBar:IsMouseOver()
-
-        if over ~= hovered then
-            hovered = over
-
-            if over then
-                self:ShowStatusBarText()
-            else
-                self:HideStatusBarText()
-            end
-        end
-    end)
-
-    holder:SetScript("OnHide", function(self)
-        if hovered then
-            hovered = false
-            self:HideStatusBarText()
-        end
-    end)
-
     return function()
-        holder.unit = unit
-        holder.powerType = manaBar.powerType
+        local maxPower = UnitPowerMax(unit, manaBar.powerType)
+        local power = UnitPower(unit, manaBar.powerType)
 
-        local maxPower = UnitPowerMax(unit, holder.powerType)
-        local power = UnitPower(unit, holder.powerType)
+        holder.forceHideText = false
+
+        if IsExactlyZero(maxPower) then
+            maxPower = 1
+            holder.forceHideText = true
+        end
 
         holder:SetMinMaxValues(0, maxPower)
         holder:SetValue(power)
-
-        -- Numeric text follows the unit's position; the percentage stays left.
-        local position = PositionFor(unit)
-        PlaceNumericText(centerText, holder, leftText, position, MANA_TEXT_X, MANA_TEXT_Y)
-        PlaceNumericText(rightText, holder, leftText, position, MANA_TEXT_X, MANA_TEXT_Y)
-
-        holder:UpdateTextString()
+        holder.RefreshStatusText()
     end
 end
 
@@ -923,6 +787,32 @@ local function CreateUnitHealthBar(config)
         manaBackground = CreateManaBackground(main.ManaBarArea, manaBar)
     end
 
+    -- Health text, built by our own code.
+    local healthSource = {
+        value = function()
+            return UnitHealth(unit)
+        end,
+        max = function()
+            return UnitHealthMax(unit)
+        end,
+        missing = function()
+            return UnitHealthMissing(unit)
+        end,
+        forceHide = function()
+            return overlay.forceHideText
+        end,
+    }
+
+    AttachStatusText(
+        overlay,
+        overlay,
+        healthText,
+        function()
+            return charDb[config.healthFormatKey] or DEFAULT_FORMAT
+        end,
+        healthSource
+    )
+
     local UpdatePrediction = CreatePredictionBars(container, overlay, unit)
 
     local ManaSafeUpdate = MakeManaUpdater(
@@ -955,7 +845,7 @@ local function CreateUnitHealthBar(config)
         -- Prediction runs before health, so a failure in the health text
         -- cannot stop the heal and absorb bars from updating.
         UpdatePrediction()
-        UpdateHealth(overlay, healthText, unit)
+        UpdateHealth(overlay, unit)
 
         ShowAll()
     end
@@ -1006,7 +896,16 @@ local function CreateUnitHealthBar(config)
     SafeRegister(events, "UNIT_HEAL_PREDICTION", unit)
     SafeRegister(events, "UNIT_ABSORB_AMOUNT_CHANGED", unit)
 
-    events:SetScript("OnEvent", function(_, event)
+    events:SetScript("OnEvent", function(_, event, arg1)
+        -- The Status Text option changed: refresh so the text shows or hides.
+        if event == "CVAR_UPDATE" then
+            if arg1 == "statusText" then
+                SafeUpdate()
+            end
+
+            return
+        end
+
         if event == "UNIT_POWER_UPDATE" or event == "UNIT_MAXPOWER" then
             ManaSafeUpdate()
             return
@@ -1062,11 +961,12 @@ do
         end,
         hasManaBackground = true,
 
+        healthFormatKey = "playerFormat",
         manaName = "BigPlayerManaText",
         manaFormatKey = "playerManaFormat",
         applyColor = ApplyPlayerColor,
 
-        globalEvents = { "PLAYER_ENTERING_WORLD" },
+        globalEvents = { "PLAYER_ENTERING_WORLD", "CVAR_UPDATE" },
         unitEvents = {
             "UNIT_HEALTH",
             "UNIT_MAXHEALTH",
@@ -1100,11 +1000,12 @@ do
         end,
         hasManaBackground = false,
 
+        healthFormatKey = "targetFormat",
         manaName = "BigTargetManaText",
         manaFormatKey = "targetManaFormat",
         applyColor = ApplyTargetColor,
 
-        globalEvents = { "PLAYER_TARGET_CHANGED", "PLAYER_ENTERING_WORLD" },
+        globalEvents = { "PLAYER_TARGET_CHANGED", "PLAYER_ENTERING_WORLD", "CVAR_UPDATE" },
         unitEvents = {
             "UNIT_HEALTH",
             "UNIT_MAXHEALTH",
@@ -1133,40 +1034,17 @@ local function RefreshAll()
     end
 end
 
-local function CreateDropdown(panel, anchor, key, entries)
+local function CreateDropdown(panel, anchor, key)
     local dropdown = CreateFrame("DropdownButton", nil, panel, "WowStyle1DropdownTemplate")
     dropdown:SetPoint("TOPLEFT", anchor, "BOTTOMLEFT", 0, -6)
     dropdown:SetWidth(200)
     dropdown:SetupMenu(function(_, root)
-        for _, entry in ipairs(entries) do
+        for _, entry in ipairs(FORMATS) do
             local value, label = entry[1], entry[2]
             root:CreateRadio(label,
                 function() return charDb[key] == value end,
                 function()
                     charDb[key] = value
-                    RefreshAll()
-                end,
-                value)
-        end
-    end)
-
-    return dropdown
-end
-
--- Blizzard's Status Text setter (Interface.lua, SetValue). It sets the mode
--- and the lock CVar "statusText": "1" keeps the text shown, "0" (None) hides it.
-local function CreateStatusTextDropdown(panel, anchor)
-    local dropdown = CreateFrame("DropdownButton", nil, panel, "WowStyle1DropdownTemplate")
-    dropdown:SetPoint("TOPLEFT", anchor, "BOTTOMLEFT", 0, -6)
-    dropdown:SetWidth(200)
-    dropdown:SetupMenu(function(_, root)
-        for _, entry in ipairs(STATUS_TEXT_OPTIONS) do
-            local value, label = entry[1], entry[2]
-            root:CreateRadio(label,
-                function() return GetCVar(STATUS_TEXT_CVAR) == value end,
-                function()
-                    SetCVar(STATUS_TEXT_CVAR, value)
-                    SetCVar("statusText", value == "NONE" and "0" or "1")
                     RefreshAll()
                 end,
                 value)
@@ -1184,13 +1062,6 @@ local function CreateOptions()
     title:SetPoint("TOPLEFT", 16, -16)
     title:SetText("BigHealthBarForever")
 
-    -- Status Text sits above the columns.
-    local statusLabel = panel:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
-    statusLabel:SetPoint("TOPLEFT", title, "BOTTOMLEFT", 0, -24)
-    statusLabel:SetText("Status Text:")
-
-    local statusDropdown = CreateStatusTextDropdown(panel, statusLabel)
-
     -- Distance from the left edge of one column to the next.
     local COLUMN_WIDTH = 260
 
@@ -1198,17 +1069,15 @@ local function CreateOptions()
         {
             header = "Player",
             rows = {
-                {"playerFormat",       "Health text:"},
-                {"playerManaFormat",   "Mana text:"},
-                {"playerTextPosition", "Text position:", TEXT_POSITIONS},
+                {"playerFormat",     "Health text:"},
+                {"playerManaFormat", "Mana text:"},
             },
         },
         {
             header = "Target",
             rows = {
-                {"targetFormat",       "Health text:"},
-                {"targetManaFormat",   "Mana text:"},
-                {"targetTextPosition", "Text position:", TEXT_POSITIONS},
+                {"targetFormat",     "Health text:"},
+                {"targetManaFormat", "Mana text:"},
             },
         },
     }
@@ -1219,7 +1088,7 @@ local function CreateOptions()
         local left = 16 + (col - 1) * COLUMN_WIDTH
 
         local header = panel:CreateFontString(nil, "ARTWORK", "GameFontNormal")
-        header:SetPoint("TOPLEFT", statusDropdown, "BOTTOMLEFT", left - 16, -24)
+        header:SetPoint("TOPLEFT", title, "BOTTOMLEFT", left - 16, -24)
         header:SetText(column.header)
 
         local anchor = header
@@ -1228,7 +1097,7 @@ local function CreateOptions()
             local label = panel:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
             label:SetPoint("TOPLEFT", anchor, "BOTTOMLEFT", 0, -20)
             label:SetText(row[2])
-            anchor = CreateDropdown(panel, label, row[1], row[3] or FORMATS)
+            anchor = CreateDropdown(panel, label, row[1])
         end
 
         columnEnds[col] = anchor
@@ -1236,6 +1105,7 @@ local function CreateOptions()
 
     local note = panel:CreateFontString(nil, "ARTWORK", "GameFontDisableSmall")
     note:SetPoint("TOPLEFT", columnEnds[1], "BOTTOMLEFT", 0, -12)
+    note:SetText("If a value can't be read in combat, the text falls back to Current.")
 
     local command = panel:CreateFontString(nil, "ARTWORK", "GameFontDisableSmall")
     command:SetPoint("TOPLEFT", note, "BOTTOMLEFT", 0, -6)
@@ -1256,7 +1126,7 @@ loader:SetScript("OnEvent", function(self, _, name)
     if name ~= ADDON then return end
 
     -- Saved per character. Fill in missing values and reject unknown
-    -- formats and positions, as StatusTextFormat.lua does.
+    -- formats, as StatusTextFormat.lua does.
     BigHealthBarForeverCharDB = BigHealthBarForeverCharDB or {}
     local saved = BigHealthBarForeverCharDB
 
@@ -1271,20 +1141,6 @@ loader:SetScript("OnEvent", function(self, _, name)
 
         if not valid then
             saved[key] = DEFAULT_FORMAT
-        end
-    end
-
-    for _, key in ipairs({ "playerTextPosition", "targetTextPosition" }) do
-        local valid = false
-
-        for _, entry in ipairs(TEXT_POSITIONS) do
-            if entry[1] == saved[key] then
-                valid = true
-            end
-        end
-
-        if not valid then
-            saved[key] = DEFAULT_TEXT_POSITION
         end
     end
 
